@@ -1,10 +1,22 @@
-# Kagent Slack Bot with HITL Approval Support
+# kagent Slack Bot with HITL Approval Support
 
 Shoutout: The original slackbot is from @Matcham89 located at https://github.com/Matcham89/slackbot-agent. All credit goes to him.
 
-A Slack bot that connects your workspace to Kagent's Kubernetes AI agents using the A2A (Agent2Agent) protocol. Supports **Human-in-the-Loop (HITL)** approvals — when an agent hits a `requireApproval` tool (like `k8s_create_resource` or `create_pull_request`), the bot posts interactive Approve / Deny buttons directly in Slack.
+A Slack bot that connects your workspace to kagent AI agents using the A2A (Agent2Agent) protocol. Supports **Human-in-the-Loop (HITL)** approvals — when an agent hits a `requireApproval` tool (like `create_pull_request`), the bot posts interactive Approve / Deny buttons directly in Slack.
 
 ![slackbot kagent sync](./image/slackkagent.gif)
+
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Slack App Setup](#slack-app-setup)
+- [Configuration](#configuration)
+- [Deploy](#deploy)
+- [HITL Approval Flow](#hitl-approval-flow)
+- [Usage](#usage)
+- [Build](#build)
 
 ## Features
 
@@ -15,6 +27,26 @@ A Slack bot that connects your workspace to Kagent's Kubernetes AI agents using 
 - **Text-based approve/deny** — Type "approve" or "deny" in threads as an alternative to buttons
 - **Message chunking** — Long responses split at 3000 chars
 - **Health probes** — Writes `/tmp/bot-healthy` for K8s liveness/readiness
+
+## Architecture
+
+```
+Slack  <-->  slack-bot (Socket Mode)  <-->  kagent A2A  <-->  agentevals-agent
+                                                                  |
+                                                        +---------+---------+
+                                                        |                   |
+                                                   slack-mcp          github-mcp
+                                                (slack_post_message)  (GitHub Copilot MCP)
+```
+
+The **agentevals-agent** is focused on managing the documentation site for agentevals (`agentevals-dev/website`). It has access to:
+
+| MCP Server | Tools | Purpose |
+|-----------|-------|---------|
+| `slack-mcp` | `slack_post_message` | Post updates to Slack channels |
+| `github-mcp` | `get_file_contents`, `create_or_update_file`, `push_files`, `create_branch`, `create_issue`, `create_pull_request`, etc. | Manage docs in agentevals-dev/website |
+
+Mutating GitHub tools (`create_or_update_file`, `push_files`, `create_pull_request`, `merge_pull_request`) require HITL approval.
 
 ## Prerequisites
 
@@ -43,12 +75,12 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 
 # Option 1: Full URL
-KAGENT_A2A_URL=http://kagent-controller.kagent.svc.cluster.local:8083/api/a2a/kagent/k8s-agent
+KAGENT_A2A_URL=http://kagent-controller.kagent.svc.cluster.local:8083/api/a2a/kagent/agentevals-agent
 
 # Option 2: Separate components
 KAGENT_BASE_URL=http://kagent-controller.kagent.svc.cluster.local:8083
 KAGENT_NAMESPACE=kagent
-KAGENT_AGENT_NAME=slackbot-k8s-agent
+KAGENT_AGENT_NAME=agentevals-agent
 ```
 
 ## Deploy
@@ -79,23 +111,24 @@ kubectl apply -f agent-deployment.yaml
 ```
 1. User @mentions the bot with a request
 2. Bot sends message/send to kagent A2A endpoint
-3. Agent decides to call a requireApproval tool
-4. Kagent returns status.state = "input-required"
+3. Agent decides to call a requireApproval tool (e.g. create_pull_request)
+4. kagent returns status.state = "input-required"
 5. Bot posts Slack message with Approve / Deny buttons
 6. User clicks Approve or Deny (or types "approve"/"deny" in thread)
 7. Bot sends DataPart with decision_type to kagent
-8. Agent resumes and bot streams the continued response
+8. Agent resumes and bot posts the continued response
 ```
 
 ## Usage
 
 ```
 # Invite the bot to a channel
-/invite @kagent
+/invite @agentevals
 
 # Ask questions — responses appear in threads
-@kagent list all namespaces
-@kagent create a deployment for nginx in staging
+@agentevals update the quick start guide
+@agentevals create an issue to add docs for the rubric evaluator
+@agentevals open a PR to fix the typo on the configuration page
 
 # When approval is needed, click the buttons or reply:
 approve / deny
