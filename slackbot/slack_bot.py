@@ -1,18 +1,4 @@
-"""Slack bot that forwards messages to a kagent A2A agent with HITL support.
-
-Implements the full Human-in-the-Loop (HITL) approval flow: when an agent
-invokes a tool that requires approval (e.g. k8s_create_resource), the bot
-posts Slack Block Kit Approve / Deny buttons and resumes the task on click.
-
-Security Features:
-- Environment-based configuration (no hardcoded credentials)
-- Input validation and sanitization
-- Proper error handling and logging
-- Timeout protection for long-running requests
-- Thread-safe context management
-
-License: MIT
-"""
+"""Slack bot that forwards messages to a kagent A2A agent with HITL support."""
 
 import json
 import logging
@@ -20,7 +6,6 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from slack_bolt import App
@@ -30,32 +15,18 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("slack-kagent-bot")
 
-# Prevent logging of sensitive data
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("slack_bolt").setLevel(logging.INFO)
-
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 
-# Support both configuration styles:
-# 1. KAGENT_A2A_URL (full URL): http://host:port/api/a2a/namespace/agent/
-# 2. Separate components: KAGENT_BASE_URL + KAGENT_NAMESPACE + KAGENT_AGENT_NAME
-KAGENT_A2A_URL = os.getenv("KAGENT_A2A_URL", "")
-
-if KAGENT_A2A_URL:
-    # Use the full URL directly
-    if not KAGENT_A2A_URL.endswith("/"):
-        KAGENT_A2A_URL += "/"
-    logger.info("Using KAGENT_A2A_URL: %s", KAGENT_A2A_URL)
-else:
-    KAGENT_BASE_URL = os.environ["KAGENT_BASE_URL"]
-    KAGENT_NAMESPACE = os.getenv("KAGENT_NAMESPACE", "kagent")
-    KAGENT_AGENT_NAME = os.environ["KAGENT_AGENT_NAME"]
-    KAGENT_A2A_URL = f"{KAGENT_BASE_URL}/api/a2a/{KAGENT_NAMESPACE}/{KAGENT_AGENT_NAME}/"
+KAGENT_BASE_URL = os.environ["KAGENT_BASE_URL"]
+KAGENT_NAMESPACE = os.getenv("KAGENT_NAMESPACE", "kagent")
+KAGENT_AGENT_NAME = os.environ["KAGENT_AGENT_NAME"]
+KAGENT_A2A_URL = f"{KAGENT_BASE_URL}/api/a2a/{KAGENT_NAMESPACE}/{KAGENT_AGENT_NAME}/"
 
 HEALTH_FILE = Path("/tmp/bot-healthy")
 
-# Restrict to specific channels (optional, comma-separated)
+# Restrict to specific team / channels (optional)
+SLACK_TEAM_ID = os.getenv("SLACK_TEAM_ID", "")
 SLACK_CHANNEL_IDS = [c.strip() for c in os.getenv("SLACK_CHANNEL_IDS", "").split(",") if c.strip()]
 
 app = App(token=SLACK_BOT_TOKEN)
@@ -68,7 +39,7 @@ pending_approvals: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
-# A2A helpers
+# A2A helpers (mirrors telegram-bot-src patterns)
 # ---------------------------------------------------------------------------
 
 def _get_status_parts(result: dict) -> list[dict]:
@@ -303,7 +274,7 @@ def _post_approval_blocks(client, channel: str, thread_ts: str, approval_id: str
 def _post_ask_user_blocks(client, channel: str, thread_ts: str, approval_id: str, question_text: str, choices: list[str]) -> None:
     """Post a Slack message with choice buttons for ask_user."""
     elements = []
-    for choice in choices[:5]:
+    for choice in choices[:5]:  # Slack max 5 buttons per actions block
         elements.append({
             "type": "button",
             "text": {"type": "plain_text", "text": choice[:75]},
@@ -375,6 +346,7 @@ def _handle_a2a_result(result: dict, client, channel: str, thread_ts: str, updat
     state = result.get("status", {}).get("state", "")
 
     if state == "input-required":
+        # Remove the "Thinking..." message if present
         if update_ts:
             try:
                 client.chat_delete(channel=channel, ts=update_ts)
@@ -391,6 +363,7 @@ def _handle_a2a_result(result: dict, client, channel: str, thread_ts: str, updat
 # ---------------------------------------------------------------------------
 
 def _get_thread_ts(event: dict) -> str:
+    """Return the thread_ts for threading — use existing thread or start one from the message ts."""
     return event.get("thread_ts") or event.get("ts", "")
 
 
@@ -401,6 +374,7 @@ def _channel_allowed(channel: str) -> bool:
 
 
 def _find_pending_for_thread(thread_ts: str) -> tuple[str | None, dict | None]:
+    """Find a pending approval associated with a thread."""
     for aid, info in pending_approvals.items():
         if info.get("thread_ts") == thread_ts:
             return aid, info
@@ -414,7 +388,9 @@ def handle_mention(event, client, say):
     if not _channel_allowed(channel):
         return
 
+    # Strip the bot mention from the text
     text = event.get("text", "")
+    # Remove <@BOTID> prefix
     text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
     if not text:
         return
@@ -458,8 +434,10 @@ def handle_mention(event, client, say):
 @app.event("message")
 def handle_thread_reply(event, client):
     """Handle threaded replies (without @mention) if there's an active context or pending approval."""
+    # Ignore bot messages, message_changed, etc.
     if event.get("subtype"):
         return
+    # Only handle threaded replies
     thread_ts = event.get("thread_ts")
     if not thread_ts:
         return
@@ -479,6 +457,7 @@ def handle_thread_reply(event, client):
         context_id = pending.get("context_id")
         task_id = pending.get("task_id")
 
+        # Check for approve/deny keywords
         lower = text.strip().lower()
         thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Processing...")
         try:
@@ -503,6 +482,7 @@ def handle_thread_reply(event, client):
     if not context_id:
         return
 
+    # Strip bot mention if present
     text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
     if not text:
         return
@@ -542,6 +522,7 @@ def handle_approve(ack, body, client):
     context_id = pending.get("context_id")
     task_id = pending.get("task_id")
 
+    # Update the original message — remove buttons, show approved
     try:
         original_text = pending.get("description", "Tool call")
         client.chat_update(
@@ -587,6 +568,7 @@ def handle_deny(ack, body, client):
     context_id = pending.get("context_id")
     task_id = pending.get("task_id")
 
+    # Update the original message — remove buttons, show denied
     try:
         original_text = pending.get("description", "Tool call")
         client.chat_update(
@@ -638,6 +620,7 @@ def handle_choice(ack, body, client):
     context_id = pending.get("context_id")
     task_id = pending.get("task_id")
 
+    # Update the original message
     try:
         client.chat_update(
             channel=channel,
