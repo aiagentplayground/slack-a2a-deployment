@@ -81,27 +81,27 @@ spec:
             memory: "256Mi"
             cpu: "200m"
 
-        # Liveness probe - check if Python process is responsive
+        # Liveness probe - check health file written on successful Slack connection
         livenessProbe:
           exec:
             command:
             - python
             - -c
-            - "import sys; sys.exit(0)"
-          initialDelaySeconds: 10
+            - "import os; assert os.path.exists('/tmp/bot-healthy')"
+          initialDelaySeconds: 15
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 3
 
-        # Readiness probe - bot must be running to be ready
+        # Readiness probe
         readinessProbe:
           exec:
             command:
             - python
             - -c
-            - "import sys; sys.exit(0)"
-          initialDelaySeconds: 5
-          periodSeconds: 10
+            - "import os; assert os.path.exists('/tmp/bot-healthy')"
+          initialDelaySeconds: 10
+          periodSeconds: 15
           timeoutSeconds: 5
 
       # Volumes for temporary files (required with readOnlyRootFilesystem)

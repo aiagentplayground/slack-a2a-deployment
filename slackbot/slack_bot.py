@@ -1,9 +1,8 @@
-"""
-Kagent Slack Bot - A2A Protocol Integration
+"""Slack bot that forwards messages to a kagent A2A agent with HITL support.
 
-A secure Slack bot that connects your workspace to Kagent's Kubernetes AI agents
-using the A2A (Agent2Agent) protocol. Implements conversation threading and
-context management for natural language interactions with your cluster.
+Implements the full Human-in-the-Loop (HITL) approval flow: when an agent
+invokes a tool that requires approval (e.g. k8s_create_resource), the bot
+posts Slack Block Kit Approve / Deny buttons and resumes the task on click.
 
 Security Features:
 - Environment-based configuration (no hardcoded credentials)
@@ -14,343 +13,668 @@ Security Features:
 
 License: MIT
 """
-import os
+
 import json
 import logging
-import hashlib
-from typing import Optional, Dict
-import requests
-from sseclient import SSEClient
+import os
+import re
+import uuid
+from pathlib import Path
+from typing import Optional
+
+import httpx
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from dotenv import load_dotenv
 
-# Configure logging with security in mind
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("slack-kagent-bot")
 
-# Security: Prevent logging of sensitive data
-logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('slack_bolt').setLevel(logging.INFO)
+# Prevent logging of sensitive data
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("slack_bolt").setLevel(logging.INFO)
 
-# Load environment variables
-load_dotenv()
-
-class KagentClient:
-    def __init__(self, base_url: str, namespace: str, agent_name: str):
-        self.base_url = base_url
-        self.namespace = namespace
-        self.agent_name = agent_name
-        self.endpoint = f"{base_url}/api/a2a/{namespace}/{agent_name}/"
-        self.thread_contexts: Dict[str, str] = {}  # Map thread_ts -> contextId
-
-        logger.info(f"🔧 Kagent client initialized")
-        logger.info(f"   Endpoint: {self.endpoint}")
-    
-    def send_message(self, text: str, thread_id: Optional[str] = None) -> Dict:
-        """
-        Send message to Kagent and extract response from SSE stream
-
-        Args:
-            text: User message to send to the agent
-            thread_id: Optional thread identifier for conversation continuity
-
-        Returns:
-            Dict with keys: response (str), status (str), contextId (str)
-
-        Security:
-            - Input is not sanitized as it's passed to AI agent, not executed
-            - Timeout protection prevents infinite waits
-            - SSL verification enabled by default (via requests library)
-        """
-        # Security: Truncate message in logs to prevent log injection
-        safe_msg = text[:100].replace('\n', ' ').replace('\r', '')
-        logger.info(f"📤 Sending message to Kagent")
-        logger.info(f"   Thread ID: {thread_id}")
-        logger.info(f"   Message: {safe_msg}...")
-        
-        # Prepare JSON-RPC 2.0 request
-        # Security: Use hashlib for deterministic message ID generation
-        msg_hash = hashlib.sha256(f"{text}{thread_id}".encode()).hexdigest()[:16]
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "message/stream",
-            "params": {
-                "message": {
-                    "role": "user",
-                    "parts": [{"kind": "text", "text": text}],
-                    "messageId": f"msg-{msg_hash}"
-                }
-            }
-        }
-        
-        # Include contextId for thread continuity
-        if thread_id and thread_id in self.thread_contexts:
-            payload["params"]["message"]["contextId"] = self.thread_contexts[thread_id]
-            logger.info(f"🔄 Using existing contextId: {self.thread_contexts[thread_id]}")
-        else:
-            logger.info(f"🆕 Starting new conversation")
-        
-        # Make streaming request
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "User-Agent": "kagent-slack-bot/1.0.0"
-        }
-
-        try:
-            # Security: SSL verification enabled by default
-            # Security: Timeout prevents hanging connections
-            response = requests.post(
-                self.endpoint,
-                json=payload,
-                headers=headers,
-                stream=True,
-                timeout=300,  # 5 minute timeout
-                verify=True  # Explicit SSL verification (default, but shown for clarity)
-            )
-            response.raise_for_status()
-            
-            # Parse SSE stream
-            result = self._parse_stream(response, thread_id)
-            
-            logger.info(f"✅ Message processed")
-            logger.info(f"   Status: {result['status']}")
-            logger.info(f"   Context ID: {result['contextId']}")
-            logger.info(f"   Response length: {len(result['response'] or '')}")
-            
-            return result
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"⏱️ Request timeout after 300s")
-            return {
-                'response': "Request timed out. Please try again.",
-                'status': 'timeout',
-                'contextId': None
-            }
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Request failed: {e}")
-            return {
-                'response': f"Failed to connect to Kagent: {str(e)}",
-                'status': 'error',
-                'contextId': None
-            }
-    
-    def _parse_stream(self, response, thread_id: Optional[str]) -> Dict:
-        """
-        Parse SSE events and extract agent response
-        """
-        client = SSEClient(response)
-        agent_response = None
-        context_id = None
-        status = "unknown"
-        event_count = 0
-        
-        logger.debug(f"📡 Starting SSE stream parsing")
-        
-        for event in client.events():
-            # Skip empty events
-            if not event.data or not event.data.strip():
-                continue
-            
-            event_count += 1
-            
-            try:
-                # Each event.data contains a JSON-RPC response
-                json_rpc_response = json.loads(event.data)
-                
-                # Handle JSON-RPC errors
-                if 'error' in json_rpc_response:
-                    error = json_rpc_response['error']
-                    logger.error(f"❌ JSON-RPC error: {error}")
-                    return {
-                        'response': f"Agent error: {error.get('message', 'Unknown error')}",
-                        'status': 'error',
-                        'contextId': context_id
-                    }
-                
-                # Extract the actual event from the JSON-RPC wrapper
-                event_data = json_rpc_response.get('result', {})
-                
-                if not event_data:
-                    logger.warning(f"⚠️ Empty result in JSON-RPC response")
-                    continue
-                
-                # Log event details
-                logger.debug(f"📦 Event {event_count}: kind={event_data.get('kind')}, "
-                           f"final={event_data.get('final')}, "
-                           f"status={event_data.get('status', {}).get('state')}")
-                
-                # Store contextId for conversation continuity
-                if 'contextId' in event_data:
-                    context_id = event_data['contextId']
-                    if thread_id:
-                        self.thread_contexts[thread_id] = context_id
-                
-                # Track status
-                if 'status' in event_data:
-                    status = event_data['status'].get('state', status)
-                    
-                    # Check if this event contains the agent response
-                    if 'message' in event_data['status']:
-                        message = event_data['status']['message']
-                        
-                        # Only process agent messages (not user echoes)
-                        if message.get('role') == 'agent':
-                            # Extract text from parts
-                            parts = message.get('parts', [])
-                            if parts and len(parts) > 0:
-                                agent_response = parts[0].get('text', '')
-                                logger.debug(f"💬 Found agent response: {agent_response[:100]}...")
-                
-                # Check if this is the final event
-                if event_data.get('final'):
-                    logger.debug(f"🏁 Received final event")
-                    break
-                    
-            except json.JSONDecodeError as e:
-                logger.error(f"⚠️ Failed to parse event: {event.data[:200]}")
-                continue
-            except Exception as e:
-                logger.error(f"⚠️ Error processing event: {e}")
-                continue
-        
-        logger.info(f"📊 Processed {event_count} events from stream")
-        
-        return {
-            'response': agent_response,
-            'status': status,
-            'contextId': context_id
-        }
-
-
-# Initialize Slack app
-logger.info("🚀 Initializing Slack bot...")
-
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 
 # Support both configuration styles:
-# 1. KAGENT_A2A_URL (full URL): http://host:port/api/a2a/namespace/agent
+# 1. KAGENT_A2A_URL (full URL): http://host:port/api/a2a/namespace/agent/
 # 2. Separate components: KAGENT_BASE_URL + KAGENT_NAMESPACE + KAGENT_AGENT_NAME
-KAGENT_A2A_URL = os.environ.get("KAGENT_A2A_URL")
+KAGENT_A2A_URL = os.getenv("KAGENT_A2A_URL", "")
 
 if KAGENT_A2A_URL:
-    # Parse the full URL to extract components
-    # Format: http://host:port/api/a2a/namespace/agent
-    logger.info(f"📋 Using KAGENT_A2A_URL: {KAGENT_A2A_URL}")
-
-    # Extract base URL (everything before /api/a2a/)
-    if "/api/a2a/" in KAGENT_A2A_URL:
-        KAGENT_BASE_URL = KAGENT_A2A_URL.split("/api/a2a/")[0]
-        # Extract namespace/agent from path
-        path_parts = KAGENT_A2A_URL.split("/api/a2a/")[1].rstrip("/").split("/")
-        KAGENT_NAMESPACE = path_parts[0] if len(path_parts) > 0 else None
-        KAGENT_AGENT_NAME = path_parts[1] if len(path_parts) > 1 else None
-
-        logger.info(f"   Parsed base URL: {KAGENT_BASE_URL}")
-        logger.info(f"   Parsed namespace: {KAGENT_NAMESPACE}")
-        logger.info(f"   Parsed agent: {KAGENT_AGENT_NAME}")
-    else:
-        logger.error("❌ Invalid KAGENT_A2A_URL format. Expected: http://host:port/api/a2a/namespace/agent")
-        exit(1)
+    # Use the full URL directly
+    if not KAGENT_A2A_URL.endswith("/"):
+        KAGENT_A2A_URL += "/"
+    logger.info("Using KAGENT_A2A_URL: %s", KAGENT_A2A_URL)
 else:
-    # Use separate component variables (no defaults - must be provided)
-    KAGENT_BASE_URL = os.environ.get("KAGENT_BASE_URL")
-    KAGENT_NAMESPACE = os.environ.get("KAGENT_NAMESPACE")
-    KAGENT_AGENT_NAME = os.environ.get("KAGENT_AGENT_NAME")
-    logger.info(f"📋 Using separate env vars")
+    KAGENT_BASE_URL = os.environ["KAGENT_BASE_URL"]
+    KAGENT_NAMESPACE = os.getenv("KAGENT_NAMESPACE", "kagent")
+    KAGENT_AGENT_NAME = os.environ["KAGENT_AGENT_NAME"]
+    KAGENT_A2A_URL = f"{KAGENT_BASE_URL}/api/a2a/{KAGENT_NAMESPACE}/{KAGENT_AGENT_NAME}/"
 
-# Validate required environment variables
-if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
-    logger.error("❌ Missing required environment variables: SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN")
-    exit(1)
+HEALTH_FILE = Path("/tmp/bot-healthy")
 
-if not KAGENT_BASE_URL:
-    logger.error("❌ Missing required environment variable: KAGENT_BASE_URL or KAGENT_A2A_URL")
-    exit(1)
-
-if not KAGENT_NAMESPACE:
-    logger.error("❌ Missing required environment variable: KAGENT_NAMESPACE (or provide KAGENT_A2A_URL)")
-    exit(1)
-
-if not KAGENT_AGENT_NAME:
-    logger.error("❌ Missing required environment variable: KAGENT_AGENT_NAME (or provide KAGENT_A2A_URL)")
-    exit(1)
+# Restrict to specific channels (optional, comma-separated)
+SLACK_CHANNEL_IDS = [c.strip() for c in os.getenv("SLACK_CHANNEL_IDS", "").split(",") if c.strip()]
 
 app = App(token=SLACK_BOT_TOKEN)
-kagent = KagentClient(
-    base_url=KAGENT_BASE_URL,
-    namespace=KAGENT_NAMESPACE,
-    agent_name=KAGENT_AGENT_NAME
-)
 
-logger.info("✅ Slack app initialized")
+# Per-thread A2A context: thread_ts -> contextId
+thread_contexts: dict[str, str] = {}
+
+# Pending HITL approvals: approval_id -> {task_id, context_id, channel, thread_ts, description}
+pending_approvals: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# A2A helpers
+# ---------------------------------------------------------------------------
+
+def _get_status_parts(result: dict) -> list[dict]:
+    return result.get("status", {}).get("message", {}).get("parts", [])
+
+
+def _parse_adk_confirmation(data: dict) -> dict | None:
+    if data.get("name") == "adk_request_confirmation":
+        args = data.get("args", {})
+        func_call = args.get("originalFunctionCall", {})
+        tool_name = func_call.get("name", "")
+        tool_args = func_call.get("args", {})
+        hint = args.get("toolConfirmation", {}).get("hint", "")
+
+        if tool_name == "ask_user":
+            questions = tool_args.get("questions", [])
+            if isinstance(questions, str):
+                questions = [{"question": questions}]
+            return {"type": "ask_user", "tool_name": tool_name, "questions": questions, "hint": hint}
+
+        return {"type": "approval", "tool_name": tool_name, "tool_args": tool_args, "hint": hint}
+
+    if data.get("toolName"):
+        return {
+            "type": "approval",
+            "tool_name": data["toolName"],
+            "tool_args": data.get("parameters", {}),
+            "hint": "",
+        }
+
+    return None
+
+
+def _classify_input_required(result: dict) -> tuple[str, dict | None]:
+    for p in _get_status_parts(result):
+        if p.get("kind") != "data":
+            continue
+        parsed = _parse_adk_confirmation(p.get("data", {}))
+        if parsed:
+            return parsed["type"], parsed
+    return "question", None
+
+
+def _format_approval_mrkdwn(parsed: dict) -> str:
+    tool_name = parsed.get("tool_name", "unknown tool")
+    tool_args = parsed.get("tool_args", {})
+    hint = parsed.get("hint", "")
+
+    lines = [f"*Tool Approval Required*\nThe agent wants to run: `{tool_name}`"]
+    if hint:
+        lines.append(hint)
+
+    if tool_args:
+        for key, value in tool_args.items():
+            val_str = str(value)
+            if "\n" in val_str:
+                lines.append(f"\n```\n{val_str}\n```")
+            else:
+                lines.append(f"  `{key}`: {val_str}")
+
+    return "\n".join(lines)
+
+
+def _format_ask_user(parsed: dict) -> tuple[str, list[str]]:
+    questions = parsed.get("questions", [])
+    if not questions:
+        return "The agent is asking for input.", []
+
+    q_texts = []
+    all_choices = []
+    for q in questions:
+        if isinstance(q, dict):
+            q_text = q.get("question", "")
+            choices = q.get("choices", [])
+        else:
+            q_text = str(q)
+            choices = []
+        if q_text:
+            q_texts.append(q_text)
+        if choices:
+            all_choices.extend([str(c) for c in choices])
+
+    text = "\n\n".join(q_texts) if q_texts else "The agent is asking for input."
+    return text, all_choices
+
+
+def _extract_text(result: dict) -> str | None:
+    artifacts = result.get("artifacts", [])
+    if artifacts:
+        parts = artifacts[-1].get("parts", [])
+        texts = [p.get("text", "") for p in parts if p.get("kind") == "text" and p.get("text")]
+        if texts:
+            return "\n".join(texts)
+
+    for msg in reversed(result.get("history", [])):
+        if msg.get("role") != "agent":
+            continue
+        texts = [p.get("text", "") for p in msg.get("parts", []) if p.get("kind") == "text" and p.get("text")]
+        if texts:
+            return "\n".join(texts)
+
+    for p in _get_status_parts(result):
+        if p.get("kind") == "text" and p.get("text"):
+            return p["text"]
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# A2A communication
+# ---------------------------------------------------------------------------
+
+def send_a2a_message(message_text: str, context_id: str | None = None, task_id: str | None = None) -> dict:
+    message = {
+        "role": "user",
+        "kind": "message",
+        "messageId": str(uuid.uuid4()),
+        "parts": [{"kind": "text", "text": message_text}],
+    }
+    if context_id:
+        message["contextId"] = context_id
+    if task_id:
+        message["taskId"] = task_id
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": message["messageId"],
+        "method": "message/send",
+        "params": {"message": message, "metadata": {}},
+    }
+
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(KAGENT_A2A_URL, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        data = resp.json()
+
+    result = data.get("result", {})
+    state = result.get("status", {}).get("state")
+    logger.info("A2A state=%s contextId=%s taskId=%s", state, result.get("contextId"), result.get("id"))
+    return result
+
+
+def send_a2a_decision(decision: str, context_id: str | None = None, task_id: str | None = None) -> dict:
+    decision_type = "approve" if decision == "approve" else "deny"
+    decision_label = "Approved" if decision == "approve" else "Denied"
+
+    message_id = str(uuid.uuid4())
+    message = {
+        "role": "user",
+        "kind": "message",
+        "messageId": message_id,
+        "parts": [
+            {"kind": "data", "data": {"decision_type": decision_type}, "metadata": {}},
+            {"kind": "text", "text": decision_label},
+        ],
+    }
+    if context_id:
+        message["contextId"] = context_id
+    if task_id:
+        message["taskId"] = task_id
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "method": "message/send",
+        "params": {"message": message, "metadata": {}},
+    }
+
+    logger.info("Sending HITL decision=%s contextId=%s taskId=%s", decision_type, context_id, task_id)
+
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(KAGENT_A2A_URL, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        data = resp.json()
+
+    result = data.get("result", {})
+    state = result.get("status", {}).get("state")
+    logger.info("A2A decision response state=%s contextId=%s taskId=%s", state, result.get("contextId"), result.get("id"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Slack message helpers
+# ---------------------------------------------------------------------------
+
+def _send_chunked(client, channel: str, thread_ts: str, text: str, update_ts: str | None = None) -> None:
+    """Send text in 3000-char chunks. First chunk updates the existing message if update_ts is given."""
+    MAX_LEN = 3000
+    for i in range(0, len(text), MAX_LEN):
+        chunk = text[i: i + MAX_LEN]
+        if i == 0 and update_ts:
+            client.chat_update(channel=channel, ts=update_ts, text=chunk)
+        else:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
+
+
+def _post_approval_blocks(client, channel: str, thread_ts: str, approval_id: str, description: str) -> None:
+    """Post a Slack message with Approve / Deny buttons."""
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": description[:3000]},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "action_id": "hitl_approve",
+                    "value": approval_id,
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Deny"},
+                    "action_id": "hitl_deny",
+                    "value": approval_id,
+                    "style": "danger",
+                },
+            ],
+        },
+    ]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=description[:3000],
+        blocks=blocks,
+    )
+
+
+def _post_ask_user_blocks(client, channel: str, thread_ts: str, approval_id: str, question_text: str, choices: list[str]) -> None:
+    """Post a Slack message with choice buttons for ask_user."""
+    elements = []
+    for choice in choices[:5]:
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": choice[:75]},
+            "action_id": f"hitl_choice_{choice[:40]}",
+            "value": json.dumps({"approval_id": approval_id, "choice": choice}),
+        })
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": question_text[:3000]}},
+        {"type": "actions", "elements": elements},
+    ]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=question_text[:3000],
+        blocks=blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Result handling
+# ---------------------------------------------------------------------------
+
+def _handle_input_required(result: dict, client, channel: str, thread_ts: str) -> None:
+    context_id = result.get("contextId", "")
+    task_id = result.get("id", "")
+    kind, parsed = _classify_input_required(result)
+
+    approval_id = str(uuid.uuid4())[:8]
+    task_info = {
+        "context_id": context_id,
+        "task_id": task_id,
+        "channel": channel,
+        "thread_ts": thread_ts,
+    }
+
+    if kind == "approval" and parsed:
+        description = _format_approval_mrkdwn(parsed)
+        task_info["description"] = description
+        pending_approvals[approval_id] = task_info
+        _post_approval_blocks(client, channel, thread_ts, approval_id, description)
+
+    elif kind == "ask_user" and parsed:
+        question_text, choices = _format_ask_user(parsed)
+        task_info["description"] = question_text
+        pending_approvals[approval_id] = task_info
+
+        if choices:
+            _post_ask_user_blocks(client, channel, thread_ts, approval_id, question_text, choices)
+        else:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"{question_text}\n\n_(Reply in this thread to answer)_",
+            )
+
+    else:
+        description = _extract_text(result) or "The agent is asking for input."
+        task_info["description"] = description
+        pending_approvals[approval_id] = task_info
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"{description}\n\n_(Reply in this thread to answer)_",
+        )
+
+
+def _handle_a2a_result(result: dict, client, channel: str, thread_ts: str, update_ts: str | None = None) -> None:
+    state = result.get("status", {}).get("state", "")
+
+    if state == "input-required":
+        if update_ts:
+            try:
+                client.chat_delete(channel=channel, ts=update_ts)
+            except Exception:
+                pass
+        _handle_input_required(result, client, channel, thread_ts)
+    else:
+        text = _extract_text(result) or "Agent returned no text response."
+        _send_chunked(client, channel, thread_ts, text, update_ts=update_ts)
+
+
+# ---------------------------------------------------------------------------
+# Slack event handlers
+# ---------------------------------------------------------------------------
+
+def _get_thread_ts(event: dict) -> str:
+    return event.get("thread_ts") or event.get("ts", "")
+
+
+def _channel_allowed(channel: str) -> bool:
+    if not SLACK_CHANNEL_IDS:
+        return True
+    return channel in SLACK_CHANNEL_IDS
+
+
+def _find_pending_for_thread(thread_ts: str) -> tuple[str | None, dict | None]:
+    for aid, info in pending_approvals.items():
+        if info.get("thread_ts") == thread_ts:
+            return aid, info
+    return None, None
 
 
 @app.event("app_mention")
-def handle_mention(event, say, logger):
-    """
-    Handle @kagent mentions in Slack
-    """
-    logger.info(f"🔔 Received app_mention")
-    logger.info(f"   Channel: {event.get('channel')}")
-    logger.info(f"   User: {event.get('user')}")
-    logger.info(f"   Text: {event.get('text')}")
-    
-    # Get thread_ts: use existing thread or start new one
-    thread_ts = event.get("thread_ts") or event.get("ts")
-    logger.info(f"   Thread: {thread_ts}")
-    
-    # Extract user message (remove bot mention)
-    user_message = event["text"]
-    user_message = user_message.split(">", 1)[-1].strip()
-    logger.info(f"   Cleaned message: {user_message}")
-    
-    if not user_message:
-        say("Please provide a message after mentioning me!", thread_ts=thread_ts)
+def handle_mention(event, client, say):
+    """Handle @bot mentions — forward to kagent A2A."""
+    channel = event.get("channel", "")
+    if not _channel_allowed(channel):
         return
-    
-    # Acknowledge receipt
-    say("🤔 Processing your request...", thread_ts=thread_ts)
-    
+
+    text = event.get("text", "")
+    text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+    if not text:
+        return
+
+    thread_ts = _get_thread_ts(event)
+    logger.info("Mention in %s (thread=%s): %s", channel, thread_ts, text[:100])
+
+    # Check if this is a reply to a pending approval (free-text answer)
+    if event.get("thread_ts"):
+        aid, pending = _find_pending_for_thread(event["thread_ts"])
+        if pending:
+            pending_approvals.pop(aid, None)
+            context_id = pending.get("context_id")
+            task_id = pending.get("task_id")
+            thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Processing...")
+            try:
+                result = send_a2a_message(text, context_id, task_id)
+                ctx = result.get("contextId")
+                if ctx:
+                    thread_contexts[thread_ts] = ctx
+                _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+            except Exception as e:
+                logger.exception("A2A reply failed")
+                client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error: {e}")
+            return
+
+    context_id = thread_contexts.get(thread_ts)
+    thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Thinking...")
+
     try:
-        # Send to Kagent and get response
-        result = kagent.send_message(user_message, thread_id=thread_ts)
-        
-        if result['status'] == 'completed' and result['response']:
-            say(result['response'], thread_ts=thread_ts)
-        elif result['status'] == 'failed':
-            say(f"❌ Task failed: {result['response']}", thread_ts=thread_ts)
-        elif result['status'] in ['timeout', 'error']:
-            say(result['response'], thread_ts=thread_ts)
-        else:
-            say(f"⚠️ No response received from agent (status: {result['status']})", thread_ts=thread_ts)
-            
+        result = send_a2a_message(text, context_id)
+        ctx = result.get("contextId")
+        if ctx:
+            thread_contexts[thread_ts] = ctx
+        _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
     except Exception as e:
-        logger.error(f"❌ Error in handle_mention: {e}", exc_info=True)
-        say(f"❌ Failed to process request: {str(e)}", thread_ts=thread_ts)
+        logger.exception("A2A request failed")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error contacting agent: {e}")
 
 
 @app.event("message")
-def handle_message_events(body, logger):
-    """
-    Handle other message events (for debugging)
-    """
-    logger.debug(f"Message event: {body.get('event', {}).get('type')}")
+def handle_thread_reply(event, client):
+    """Handle threaded replies (without @mention) if there's an active context or pending approval."""
+    if event.get("subtype"):
+        return
+    thread_ts = event.get("thread_ts")
+    if not thread_ts:
+        return
 
+    channel = event.get("channel", "")
+    if not _channel_allowed(channel):
+        return
+
+    text = event.get("text", "")
+    if not text.strip():
+        return
+
+    # Check for pending approval first
+    aid, pending = _find_pending_for_thread(thread_ts)
+    if pending:
+        pending_approvals.pop(aid, None)
+        context_id = pending.get("context_id")
+        task_id = pending.get("task_id")
+
+        lower = text.strip().lower()
+        thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Processing...")
+        try:
+            if lower in ("approve", "approved", "yes", "y"):
+                result = send_a2a_decision("approve", context_id, task_id)
+            elif lower in ("deny", "denied", "reject", "rejected", "no", "n"):
+                result = send_a2a_decision("deny", context_id, task_id)
+            else:
+                result = send_a2a_message(text, context_id, task_id)
+
+            ctx = result.get("contextId")
+            if ctx:
+                thread_contexts[thread_ts] = ctx
+            _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+        except Exception as e:
+            logger.exception("A2A reply failed")
+            client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error: {e}")
+        return
+
+    # If there's an existing context for this thread, continue the conversation
+    context_id = thread_contexts.get(thread_ts)
+    if not context_id:
+        return
+
+    text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+    if not text:
+        return
+
+    thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Thinking...")
+    try:
+        result = send_a2a_message(text, context_id)
+        ctx = result.get("contextId")
+        if ctx:
+            thread_contexts[thread_ts] = ctx
+        _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+    except Exception as e:
+        logger.exception("A2A request failed")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error contacting agent: {e}")
+
+
+# ---------------------------------------------------------------------------
+# HITL action handlers (button clicks)
+# ---------------------------------------------------------------------------
+
+@app.action("hitl_approve")
+def handle_approve(ack, body, client):
+    ack()
+    approval_id = body["actions"][0]["value"]
+    pending = pending_approvals.pop(approval_id, None)
+
+    if not pending:
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            thread_ts=body["message"].get("thread_ts", body["message"]["ts"]),
+            text="This approval has expired or was already handled.",
+        )
+        return
+
+    channel = pending["channel"]
+    thread_ts = pending["thread_ts"]
+    context_id = pending.get("context_id")
+    task_id = pending.get("task_id")
+
+    try:
+        original_text = pending.get("description", "Tool call")
+        client.chat_update(
+            channel=channel,
+            ts=body["message"]["ts"],
+            text=f"{original_text}\n\n:white_check_mark: *Approved*",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"{original_text[:2900]}\n\n:white_check_mark: *Approved*"}},
+            ],
+        )
+    except Exception:
+        pass
+
+    thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Approved. Processing...")
+
+    try:
+        result = send_a2a_decision("approve", context_id, task_id)
+        ctx = result.get("contextId")
+        if ctx:
+            thread_contexts[thread_ts] = ctx
+        _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+    except Exception as e:
+        logger.exception("A2A approval failed")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error sending approval: {e}")
+
+
+@app.action("hitl_deny")
+def handle_deny(ack, body, client):
+    ack()
+    approval_id = body["actions"][0]["value"]
+    pending = pending_approvals.pop(approval_id, None)
+
+    if not pending:
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            thread_ts=body["message"].get("thread_ts", body["message"]["ts"]),
+            text="This action has expired or was already handled.",
+        )
+        return
+
+    channel = pending["channel"]
+    thread_ts = pending["thread_ts"]
+    context_id = pending.get("context_id")
+    task_id = pending.get("task_id")
+
+    try:
+        original_text = pending.get("description", "Tool call")
+        client.chat_update(
+            channel=channel,
+            ts=body["message"]["ts"],
+            text=f"{original_text}\n\n:x: *Denied*",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"{original_text[:2900]}\n\n:x: *Denied*"}},
+            ],
+        )
+    except Exception:
+        pass
+
+    thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Denied. Processing...")
+
+    try:
+        result = send_a2a_decision("deny", context_id, task_id)
+        ctx = result.get("contextId")
+        if ctx:
+            thread_contexts[thread_ts] = ctx
+        _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+    except Exception as e:
+        logger.exception("A2A denial failed")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error sending denial: {e}")
+
+
+@app.action(re.compile(r"^hitl_choice_"))
+def handle_choice(ack, body, client):
+    ack()
+    action_value = body["actions"][0]["value"]
+    try:
+        data = json.loads(action_value)
+        approval_id = data["approval_id"]
+        choice = data["choice"]
+    except (json.JSONDecodeError, KeyError):
+        return
+
+    pending = pending_approvals.pop(approval_id, None)
+    if not pending:
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            thread_ts=body["message"].get("thread_ts", body["message"]["ts"]),
+            text="This action has expired or was already handled.",
+        )
+        return
+
+    channel = pending["channel"]
+    thread_ts = pending["thread_ts"]
+    context_id = pending.get("context_id")
+    task_id = pending.get("task_id")
+
+    try:
+        client.chat_update(
+            channel=channel,
+            ts=body["message"]["ts"],
+            text=f"Selected: {choice}",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"Selected: *{choice}*"}},
+            ],
+        )
+    except Exception:
+        pass
+
+    thinking = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Processing...")
+
+    try:
+        result = send_a2a_message(choice, context_id, task_id)
+        ctx = result.get("contextId")
+        if ctx:
+            thread_contexts[thread_ts] = ctx
+        _handle_a2a_result(result, client, channel, thread_ts, update_ts=thinking["ts"])
+    except Exception as e:
+        logger.exception("A2A choice response failed")
+        client.chat_update(channel=channel, ts=thinking["ts"], text=f"Error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logger.info("🎬 Starting Kagent Slack Bot...")
-    logger.info(f"   Kagent: {KAGENT_BASE_URL}")
-    logger.info(f"   Agent: {KAGENT_NAMESPACE}/{KAGENT_AGENT_NAME}")
-    logger.info(f"   Bot Token: {'SET' if SLACK_BOT_TOKEN else 'NOT SET'}")
-    logger.info(f"   App Token: {'SET' if SLACK_APP_TOKEN else 'NOT SET'}")
-    
+    logger.info("Starting Slack kagent bot")
+    logger.info("A2A endpoint: %s", KAGENT_A2A_URL)
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    logger.info("⚡ Bot is running! Waiting for @mentions...")
+
+    # Write health file for k8s probes
+    HEALTH_FILE.touch()
+    logger.info("Bot started with Socket Mode")
+
     handler.start()
